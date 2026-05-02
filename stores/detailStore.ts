@@ -1,6 +1,11 @@
 import { create } from "zustand";
 import { SearchResult, api } from "@/services/api";
 import { getResolutionFromM3U8 } from "@/services/m3u8";
+import {
+  SourceMetric,
+  pickBestUrl,
+  testSource,
+} from "@/services/sourceTester";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { FavoriteManager } from "@/services/storage";
 import Logger from "@/utils/Logger";
@@ -8,6 +13,95 @@ import Logger from "@/utils/Logger";
 const logger = Logger.withTag('DetailStore');
 
 export type SearchResultWithResolution = SearchResult & { resolution?: string | null };
+
+/**
+ * 后台测速优选：并发测每个源的第一集 m3u8（带 4 路并发限），
+ * 单源完成立刻 patch 到 sourceMetrics；全部跑完后按"分辨率 40%
+ * + 速度 40% + 延迟 20%"评分，未指定 preferredSource 时把 detail
+ * 切到最佳源。
+ *
+ * 提取到模块级函数避免 closure 循环依赖。
+ */
+async function runSourceOptimization(
+  get: () => DetailState,
+  set: (
+    partial:
+      | Partial<DetailState>
+      | ((state: DetailState) => Partial<DetailState>),
+  ) => void,
+  signal: AbortSignal,
+  hasPreferredSource: boolean,
+) {
+  const { searchResults } = get();
+  if (searchResults.length <= 1) return;
+
+  set({ optimizing: true });
+  const perfStart = performance.now();
+  logger.info(`[OPTIMIZE] start - ${searchResults.length} sources, preferred=${hasPreferredSource}`);
+
+  // 收集 (sourceKey, firstEpisodeUrl) 任务
+  const tasks: { key: string; url: string }[] = [];
+  for (const r of searchResults) {
+    if (r.episodes && r.episodes.length > 0) {
+      tasks.push({ key: r.source, url: r.episodes[0] });
+    }
+  }
+  if (tasks.length === 0) {
+    set({ optimizing: false });
+    return;
+  }
+
+  // 4 路并发，单源完成立即 patch 到 state
+  const CONCURRENCY = 4;
+  let cursor = 0;
+  const results: { key: string; url: string; metric: SourceMetric }[] = [];
+
+  const worker = async () => {
+    while (cursor < tasks.length && !signal.aborted) {
+      const idx = cursor++;
+      const t = tasks[idx];
+      const metric = await testSource(t.url, signal);
+      if (signal.aborted) return;
+      results.push({ key: t.key, url: t.url, metric });
+      set((state) => ({
+        sourceMetrics: { ...state.sourceMetrics, [t.key]: metric },
+      }));
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(CONCURRENCY, tasks.length) }, () => worker()),
+  );
+
+  const perfEnd = performance.now();
+  if (signal.aborted) {
+    set({ optimizing: false });
+    return;
+  }
+
+  // 选最佳并按需切换
+  const bestUrl = pickBestUrl(results);
+  if (bestUrl && !hasPreferredSource) {
+    const bestEntry = results.find((r) => r.url === bestUrl);
+    if (bestEntry) {
+      const bestSource = get().searchResults.find(
+        (r) => r.source === bestEntry.key,
+      );
+      if (bestSource && bestSource.source !== get().detail?.source) {
+        logger.info(
+          `[OPTIMIZE] switch detail to "${bestSource.source_name}" (${(perfEnd - perfStart).toFixed(0)}ms)`,
+        );
+        set({ detail: bestSource });
+      }
+    }
+  } else if (hasPreferredSource) {
+    logger.info(
+      `[OPTIMIZE] preferred source set, not auto-switching (${(perfEnd - perfStart).toFixed(0)}ms)`,
+    );
+  }
+
+  set({ optimizing: false });
+}
 
 interface DetailState {
   q: string | null;
@@ -20,6 +114,11 @@ interface DetailState {
   controller: AbortController | null;
   isFavorited: boolean;
   failedSources: Set<string>; // 记录失败的source列表
+  /**
+   * source key -> 测速结果。后台填充，用于 UI 展示和选源决策。
+   */
+  sourceMetrics: Record<string, SourceMetric>;
+  optimizing: boolean;
 
   init: (q: string, preferredSource?: string, id?: string) => Promise<void>;
   setDetail: (detail: SearchResultWithResolution) => Promise<void>;
@@ -40,6 +139,8 @@ const useDetailStore = create<DetailState>((set, get) => ({
   controller: null,
   isFavorited: false,
   failedSources: new Set(),
+  sourceMetrics: {},
+  optimizing: false,
 
   init: async (q, preferredSource, id) => {
     const perfStart = performance.now();
@@ -60,6 +161,8 @@ const useDetailStore = create<DetailState>((set, get) => ({
       error: null,
       allSourcesLoaded: false,
       controller: newController,
+      sourceMetrics: {},
+      optimizing: false,
     });
 
     const { videoSource } = useSettingsStore.getState();
@@ -325,7 +428,12 @@ const useDetailStore = create<DetailState>((set, get) => ({
       
       const favoriteCheckEnd = performance.now();
       logger.info(`[PERF] Favorite check took ${(favoriteCheckEnd - favoriteCheckStart).toFixed(2)}ms`);
-      
+
+      // 后台测速优选：搜索完成后跑，不阻塞 UI
+      const optEnabled = useSettingsStore.getState().enableSourceOptimization !== false;
+      if (optEnabled && !signal.aborted && get().searchResults.length > 1) {
+        void runSourceOptimization(get, set, signal, !!preferredSource);
+      }
     } catch (e) {
       if ((e as Error).name !== "AbortError") {
         logger.error(`[ERROR] DetailStore.init caught unexpected error:`, e);

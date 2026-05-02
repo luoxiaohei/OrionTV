@@ -39,6 +39,12 @@ export interface AppSettings {
     };
   };
   m3uUrl: string;
+  /**
+   * 自动选择最优播放源：搜索完成后并发测速（分辨率 + 下载速度 + 延迟），
+   * 综合评分把详情自动切到最佳源。从收藏/历史进入时尊重用户选择，不切换。
+   * 默认开启。
+   */
+  enableSourceOptimization?: boolean;
 }
 
 export interface LoginCredentials {
@@ -322,6 +328,7 @@ export class SettingsManager {
         sources: {},
       },
       m3uUrl: "",
+      enableSourceOptimization: true,
     };
     try {
       const data = await AsyncStorage.getItem(STORAGE_KEYS.SETTINGS);
