@@ -65,37 +65,19 @@ const useDetailStore = create<DetailState>((set, get) => ({
     const { videoSource } = useSettingsStore.getState();
 
     const processAndSetResults = async (results: SearchResult[], merge = false) => {
-      const resolutionStart = performance.now();
-      logger.info(`[PERF] Resolution detection START - processing ${results.length} sources`);
-      
-      const resultsWithResolution = await Promise.all(
-        results.map(async (searchResult) => {
-          let resolution;
-          const m3u8Start = performance.now();
-          try {
-            if (searchResult.episodes && searchResult.episodes.length > 0) {
-              resolution = await getResolutionFromM3U8(searchResult.episodes[0], signal);
-            }
-          } catch (e) {
-            if ((e as Error).name !== "AbortError") {
-              logger.info(`Failed to get resolution for ${searchResult.source_name}`, e);
-            }
-          }
-          const m3u8End = performance.now();
-          logger.info(`[PERF] M3U8 resolution for ${searchResult.source_name}: ${(m3u8End - m3u8Start).toFixed(2)}ms (${resolution || 'failed'})`);
-          return { ...searchResult, resolution };
-        })
-      );
-      
-      const resolutionEnd = performance.now();
-      logger.info(`[PERF] Resolution detection COMPLETE - took ${(resolutionEnd - resolutionStart).toFixed(2)}ms`);
-
       if (signal.aborted) return;
+
+      // 1. 先把搜索结果直接落到 state，UI 可以立刻渲染列表/起播
+      //    分辨率字段先留空，后台异步填充
+      const initialResults: SearchResultWithResolution[] = results.map((r) => ({
+        ...r,
+        resolution: undefined,
+      }));
 
       set((state) => {
         const existingSources = new Set(state.searchResults.map((r) => r.source));
-        const newResults = resultsWithResolution.filter((r) => !existingSources.has(r.source));
-        const finalResults = merge ? [...state.searchResults, ...newResults] : resultsWithResolution;
+        const newResults = initialResults.filter((r) => !existingSources.has(r.source));
+        const finalResults = merge ? [...state.searchResults, ...newResults] : initialResults;
 
         return {
           searchResults: finalResults,
@@ -106,6 +88,55 @@ const useDetailStore = create<DetailState>((set, get) => ({
           })),
           detail: state.detail ?? finalResults[0] ?? null,
         };
+      });
+
+      // 2. 后台并行拉分辨率，每完成一个就把对应 source 的 resolution 单独 patch 进 state
+      const resolutionStart = performance.now();
+      logger.info(`[PERF] Resolution detection (background) START - ${results.length} sources`);
+
+      void Promise.all(
+        results.map(async (searchResult) => {
+          if (signal.aborted) return;
+          if (!searchResult.episodes || searchResult.episodes.length === 0) return;
+
+          const m3u8Start = performance.now();
+          let resolution: string | null = null;
+          try {
+            resolution = await getResolutionFromM3U8(searchResult.episodes[0], signal);
+          } catch (e) {
+            if ((e as Error).name !== "AbortError") {
+              logger.info(`Failed to get resolution for ${searchResult.source_name}`, e);
+            }
+            return;
+          }
+          const m3u8End = performance.now();
+          logger.info(
+            `[PERF] M3U8 resolution for ${searchResult.source_name}: ${(m3u8End - m3u8Start).toFixed(2)}ms (${resolution || "failed"})`
+          );
+
+          if (signal.aborted) return;
+
+          // 单源 patch，避免覆盖期间到达的其它更新
+          set((state) => {
+            const idx = state.searchResults.findIndex((r) => r.source === searchResult.source);
+            if (idx < 0) return state;
+            const updated = [...state.searchResults];
+            updated[idx] = { ...updated[idx], resolution };
+            return {
+              searchResults: updated,
+              sources: updated.map((r) => ({
+                source: r.source,
+                source_name: r.source_name,
+                resolution: r.resolution,
+              })),
+            };
+          });
+        })
+      ).then(() => {
+        const resolutionEnd = performance.now();
+        logger.info(
+          `[PERF] Resolution detection (background) DONE - took ${(resolutionEnd - resolutionStart).toFixed(2)}ms`
+        );
       });
     };
 
