@@ -97,20 +97,18 @@ export default function PlayScreen() {
   const source = sourceStr || detail?.source;
   const id = videoId || detail?.id.toString();
   const title = videoTitle || detail?.title;
-  const {
-    isLoading,
-    showControls,
-    // showNextEpisodeOverlay,
-    initialPosition,
-    introEndTime,
-    playbackRate,
-    setVideoRef,
-    handlePlaybackStatusUpdate,
-    setShowControls,
-    // setShowNextEpisodeOverlay,
-    reset,
-    loadVideo,
-  } = usePlayerStore();
+  // 用单字段 selector 订阅，避免每次 status 更新（数倍每秒）都触发整页重渲染。
+  // Zustand 的 actions 是稳定引用，可以单独取一次。
+  const isLoading = usePlayerStore((s) => s.isLoading);
+  const showControls = usePlayerStore((s) => s.showControls);
+  const initialPosition = usePlayerStore((s) => s.initialPosition);
+  const introEndTime = usePlayerStore((s) => s.introEndTime);
+  const playbackRate = usePlayerStore((s) => s.playbackRate);
+  const setVideoRef = usePlayerStore((s) => s.setVideoRef);
+  const handlePlaybackStatusUpdate = usePlayerStore((s) => s.handlePlaybackStatusUpdate);
+  const setShowControls = usePlayerStore((s) => s.setShowControls);
+  const reset = usePlayerStore((s) => s.reset);
+  const loadVideo = usePlayerStore((s) => s.loadVideo);
   const currentEpisode = usePlayerStore(selectCurrentEpisode);
 
   // 使用Video事件处理hook
